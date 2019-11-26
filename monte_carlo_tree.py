@@ -1,12 +1,14 @@
 import uuid
 import numpy as np
 import gym
+import torch.optim as optim
 import torch
 
 
 MCTS_N_SIMULATIONS = 20
 MCTS_ROLLOUT_DEPTH = 20
 MCTS_C = 1.0
+LR = 3e-4
 
 """Random Play Tree plays go game randomly. Base class for Monte Carlo Tree."""
 class RandomPlayTree:
@@ -20,7 +22,7 @@ class RandomPlayTree:
     def pick_move(self, node):
         possible_moves = node.possible_moves()
         if len(possible_moves) == 0:
-            return None
+            return None, None
         index = np.random.choice(len(possible_moves))
         return tuple(possible_moves[index]), 1./len(possible_moves)
     
@@ -36,7 +38,7 @@ class RandomPlayTree:
     """Make a move"""
     def move(self, node, move, prob):
         # reset environment to node's state. useful in MCTS unroll situation
-        self.env.reset(node.state)
+        self.env.reset(state=node.state)
         state, _, _, _ = self.env.step(move)
         new_node = Node(node, state, move, prob)
         node.add_child(new_node)
@@ -46,6 +48,7 @@ class RandomPlayTree:
     """
     Simulation is MCTS is a sequence of moves that starts in current node and ends in terminal node. 
     During simulation moves are chosen wrt rollout policy function which in usually uniform random.
+    
     """
     def simulate(self, node):
         current_node = node
@@ -85,9 +88,17 @@ class MonteCarloPlayTree(RandomPlayTree):
             self.backpropagate(leaf, simulation_result)
 
         if node.is_terminal():
-            return None
+            return None, None
 
-        return self.node_action(node.best_child())
+        best_child = node.best_child()
+        return best_child.move, best_child.prob
+
+    """Traverse policy in uniform random"""
+    def traverse_policy(self, node):
+        unexplored_moves = list(node.possible_unexplored_moves())
+        index = np.random.choice(len(unexplored_moves))
+        move = unexplored_moves[index]
+        return move, 1. / len(node.possible_moves())
 
     """
     Traverse a node. Pick a path prioritizing highest UTC for fully explored nodes 
@@ -98,12 +109,17 @@ class MonteCarloPlayTree(RandomPlayTree):
             return node
 
         if node.is_fully_expanded():
-            return self.traverse(node.best_uct())
-        
-        possible_moves = list(node.possible_unexplored_moves())
-        index = np.random.choice(len(possible_moves))
-        move = possible_moves[index]
-        return self.move(node, move)
+            return self.traverse(node.best_uct(self.uct))
+
+        move, prob = self.traverse_policy(node)
+        return self.move(node, move, prob)
+
+    """
+    A Policy used to pick next best move
+    In Non-Neural Monte Carlo Tree we are using random uniform
+    """
+    def rollout_policy(self, node):
+        return self.traverse_policy(node)
 
     """Rollout a node according to a rollout policy."""
     def rollout(self, node, depth):
@@ -111,17 +127,8 @@ class MonteCarloPlayTree(RandomPlayTree):
             return node
         if node.is_terminal():
             return node
-        return self.rollout(self.rollout_policy(node), depth+1)
-
-    """
-    A Policy used to pick next best move
-    In Non-Neural Monte Carlo Tree we are using random uniform
-    """
-    def rollout_policy(self, node):
-        possible_moves = list(node.possible_unexplored_moves())
-        index = np.random.choice(len(possible_moves))
-        move = possible_moves[index]
-        return self.move(node, move)
+        move, prob = self.rollout_policy(node)
+        return self.rollout(self.move(node, move, prob), depth+1)
 
     """Backpropagate node's statistics all the way up to root node"""
     def backpropagate(self, node, result):
@@ -129,13 +136,6 @@ class MonteCarloPlayTree(RandomPlayTree):
         if node.is_root():
             return
         self.backpropagate(node.parent, result)
-
-    """Get action corresponding to node"""
-    def node_action(self, node):
-        for (action, child_node) in node.parent.children.items():
-            if child_node.uuid == node.uuid:
-                return action
-        return None
 
     """
     UCT is a core of MCTS. It allows us to choose next node among visited nodes.
@@ -156,11 +156,11 @@ class MonteCarloPlayTree(RandomPlayTree):
     """
     def uct(self, node, c=MCTS_C):
         if node.current_player() == 1:
-            Q_v = self.q_black
+            Q_v = node.q_black
         else:
-            Q_v = self.q_white
-        N_v = node.number_of_visits
-        N_v_parent = node.parent.number_of_visits
+            Q_v = node.q_white
+        N_v = node.number_of_visits + 1
+        N_v_parent = node.parent.number_of_visits + 1
         
         return Q_v/N_v + c*np.sqrt(np.log(N_v_parent)/N_v) 
 
@@ -171,21 +171,29 @@ class GuidedMonteCarloPlayTree(MonteCarloPlayTree):
     def __init__(self, tree_size, actor_critic_network, device):
         super(GuidedMonteCarloPlayTree, self).__init__(tree_size)
         self.actor_critic_network = actor_critic_network
+        self.optimizer = optim.Adam(self.actor_critic_network.parameters(), lr=LR)
         self.device = device
     
     def rollout_policy(self, node):
         
-        state = node.prepared_game_state(node.current_player())
+        state = node.prepared_game_state()
         state_tensor = torch.from_numpy(state).float().to(self.device).unsqueeze(0).unsqueeze(0)
         prob, _ = self.actor_critic_network(state_tensor)
-        mask = torch.from_numpy(node.possible_moves_mask()).to(self.device)
+        mask = node.possible_moves_mask().astype(float)
 
         # TODO: test
-        table = prob[mask].view(-1).detach().cpu().numpy()
-        coordinates = np.argwhere(table > 0)
-        move = np.random.choice(coordinates, p=table[coordinates])
 
-        return self.move(node, move)
+        prob = prob.detach().cpu().numpy()
+
+        table = prob*mask
+        probs = table / table.sum()
+
+        options = np.argwhere(table!=np.nan).tolist()
+        index = np.random.choice(np.arange(self.board_size**2), p=probs.flatten())
+        move = options[index]
+        prob = table[move[0], move[1]]
+
+        return move, prob
 
     def uct(self, node, c=MCTS_C):
         N_v = node.number_of_visits
@@ -193,22 +201,49 @@ class GuidedMonteCarloPlayTree(MonteCarloPlayTree):
 
         # TODO: test
         V_current = self.estimate_node_value(node)
-        for child in node.children.values():
+        for child in node.children:
             V_current -= self.estimate_node_value(child)
         
-        return V_current/N_v + c * np.sqrt(np.log(N_v_parent)/N_v) * node.probability
+        result = V_current/N_v + c * np.sqrt(np.log(N_v_parent)/N_v) * node.prob
+
+        return result
 
     """Estimate node value with neural network"""
     def estimate_node_value(self, node):
         state = node.prepared_game_state(node.current_player())
         state_tensor = torch.from_numpy(state).float().to(self.device).unsqueeze(0).unsqueeze(0)
         _, v = self.actor_critic_network(state_tensor)
-        return v.detach().cpu().numpy()
+        return v.detach().cpu().numpy().sum()
 
-    """Train actor critic network"""
-    def train(self):
-        # TODO: implement
-        pass
+    """
+    Train guided MCTS
+    AlphaZero algorithm:
+    1. Initialize actor-critic
+    2. Simulate a game
+    3. Compute loss
+    4. Repeat
+    """
+    def train(self, n_iterations):
+        for i in range(n_iterations):
+            terminal_node = self.simulate(self.root_node)
+            last_player = terminal_node.current_player()
+            winning_player = self.evaluate_node(last_player)
+            if last_player == winning_player:
+                score = 1
+            else:
+                score = -1
+
+            trajectory = terminal_node.unroll()
+            states = np.array([node.prepared_game_state(terminal_node.current_player()) for node in trajectory])
+            states_tensor = torch.from_numpy(states).float().to(self.device)
+            probs, values = self.actor_critic_network(states_tensor)
+            # Loss function. Core of alpha-zero
+            loss = (values - score)**2 - (probs * torch.log(probs)).sum()
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            print("Iteration #", i, " loss:", loss)
+
 
 """Game Tree Node"""
 class Node:
@@ -242,7 +277,9 @@ class Node:
           -1 is opposing player
            0 available moves
     """
-    def prepared_game_state(self):
+    def prepared_game_state(self, player=None):
+        if player == None:
+            player = self.current_player()
         if self.current_player() == 1:
             state = self.blacks() - self.whites()
         else:
@@ -289,14 +326,7 @@ class Node:
 
     """How far node from root"""
     def depth(self):
-        depth = 0
-        parent = self.parent
-
-        while parent.parent is not None:
-            parent = parent.parent
-            depth += 1
-
-        return depth
+        return len(self.unroll())
 
     """Whether node is last in the game"""        
     def is_terminal(self):
@@ -304,14 +334,11 @@ class Node:
 
     """Whether node all of node's children were expanded"""
     def is_fully_expanded(self):
-        possible_moves_set = set([tuple(m) for m in self.possible_moves()])
-        explored_moves_set = set([tuple(m) for (m, n) in self.children])
-        return len(possible_moves_set-explored_moves_set) == 0
+        return len(self.possible_unexplored_moves()) == 0
 
     """Pick child node with highest UCT"""
-    def best_uct(self):
-        children = list(self.children.values())
-        return sorted(children, key=lambda node: node.uct(self.current_player()), reverse=True)[0]
+    def best_uct(self, uct_func):
+        return sorted(self.children, key=lambda node: uct_func(node), reverse=True)[0]
 
     """Pick unvisited child node"""
     def possible_unexplored_moves(self):
@@ -321,8 +348,7 @@ class Node:
 
     """Return best child nod"""
     def best_child(self):
-        children = list(self.children.values())
-        return sorted(children, key=lambda node: node.number_of_visits, reverse=True)[0]
+        return sorted(self.children, key=lambda node: node.number_of_visits, reverse=True)[0]
 
     def is_root(self):
         return self.parent == None
@@ -334,3 +360,13 @@ class Node:
             self.q_black += 1
         if result == -1:
             self.q_white += 1
+    
+    """Return list of nodes to root"""
+    def unroll(self):
+        nodes = [self]
+        node = self
+        while node.parent is not None:
+            node = node.parent
+            nodes.append(node)
+
+        return nodes
