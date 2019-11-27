@@ -5,8 +5,8 @@ import torch.optim as optim
 import torch
 
 
-MCTS_N_SIMULATIONS = 20
-MCTS_ROLLOUT_DEPTH = 20
+MCTS_N_SIMULATIONS = 10
+MCTS_ROLLOUT_DEPTH = 10
 MCTS_C = 1.0
 LR = 3e-4
 
@@ -40,8 +40,13 @@ class RandomPlayTree:
         # reset environment to node's state. useful in MCTS unroll situation
         self.env.reset(state=node.state)
         state, _, _, _ = self.env.step(move)
-        new_node = Node(node, state, move, prob)
-        node.add_child(new_node)
+        existing_nodes = list(filter(lambda n: n.move == move, node.children))
+        if len(existing_nodes):
+            new_node = existing_nodes[0]
+            new_node.prob = prob
+        else:
+            new_node = Node(node, state, move, prob)
+            node.add_child(new_node)
 
         return new_node
 
@@ -177,8 +182,9 @@ class GuidedMonteCarloPlayTree(MonteCarloPlayTree):
     def rollout_policy(self, node):
         
         state = node.prepared_game_state()
-        state_tensor = torch.from_numpy(state).float().to(self.device).unsqueeze(0).unsqueeze(0)
+        state_tensor = torch.from_numpy(state).float().to(self.device).unsqueeze(0)
         prob, _ = self.actor_critic_network(state_tensor)
+        prob = prob.squeeze()
         mask = node.possible_moves_mask().astype(float)
 
         # TODO: test
@@ -196,8 +202,8 @@ class GuidedMonteCarloPlayTree(MonteCarloPlayTree):
         return move, prob
 
     def uct(self, node, c=MCTS_C):
-        N_v = node.number_of_visits
-        N_v_parent = node.parent.number_of_visits
+        N_v = node.number_of_visits + 1
+        N_v_parent = node.parent.number_of_visits + 1
 
         # TODO: test
         V_current = self.estimate_node_value(node)
@@ -211,7 +217,7 @@ class GuidedMonteCarloPlayTree(MonteCarloPlayTree):
     """Estimate node value with neural network"""
     def estimate_node_value(self, node):
         state = node.prepared_game_state(node.current_player())
-        state_tensor = torch.from_numpy(state).float().to(self.device).unsqueeze(0).unsqueeze(0)
+        state_tensor = torch.from_numpy(state).float().to(self.device).unsqueeze(0)
         _, v = self.actor_critic_network(state_tensor)
         return v.detach().cpu().numpy().sum()
 
@@ -225,20 +231,34 @@ class GuidedMonteCarloPlayTree(MonteCarloPlayTree):
     """
     def train(self, n_iterations):
         for i in range(n_iterations):
+            print("Iteration # ", i)
             terminal_node = self.simulate(self.root_node)
             last_player = terminal_node.current_player()
-            winning_player = self.evaluate_node(last_player)
+            winning_player = self.evaluate_node(terminal_node)
             if last_player == winning_player:
                 score = 1
             else:
                 score = -1
 
             trajectory = terminal_node.unroll()
+            print("number of moves: ", len(trajectory))
             states = np.array([node.prepared_game_state(terminal_node.current_player()) for node in trajectory])
+            # actions = np.array([node.action for node in trajectory])
+            # action_probs = np.array([node.prob for node in trajectory])
+            
             states_tensor = torch.from_numpy(states).float().to(self.device)
+            # action_prob_tensors = torch.from_numpy(action_probs).float().to(self.device)
             probs, values = self.actor_critic_network(states_tensor)
             # Loss function. Core of alpha-zero
-            loss = (values - score)**2 - (probs * torch.log(probs)).sum()
+            loss_term_1 = (values - score).pow(2) #- (probs * torch.log(probs)).sum()).sum()
+            loss_term_2 = 0
+            for i, node in enumerate(trajectory):
+                prob = probs[i]
+                if node.move is not None:
+                    prob = probs[i, node.move[0], node.move[1]]
+                    loss_term_2 += node.prob * torch.log(prob+1e-5)
+
+            loss = (loss_term_1 - loss_term_2).sum()
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
@@ -360,7 +380,7 @@ class Node:
             self.q_black += 1
         if result == -1:
             self.q_white += 1
-    
+
     """Return list of nodes to root"""
     def unroll(self):
         nodes = [self]
